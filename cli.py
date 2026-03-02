@@ -52,21 +52,24 @@ def cmd_stats():
             net_devices    = total_devices - host_devices
             known_devices  = conn.execute("SELECT COUNT(*) FROM devices WHERE is_known=1").fetchone()[0]
 
-            # Online/offline from most recent scan event per device
-            online_count   = conn.execute("""
-                SELECT COUNT(*) FROM (
-                    SELECT mac, status FROM scan_events
-                    GROUP BY mac
-                    HAVING scanned_at = MAX(scanned_at)
-                ) WHERE status='online'
-            """).fetchone()[0]
-            offline_count  = conn.execute("""
-                SELECT COUNT(*) FROM (
-                    SELECT mac, status FROM scan_events
-                    GROUP BY mac
-                    HAVING scanned_at = MAX(scanned_at)
-                ) WHERE status='offline'
-            """).fetchone()[0]
+                    # CORRECT — count MACs present in the latest scan_id
+            latest_scan = conn.execute(
+                "SELECT id FROM scans ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            latest_scan_id = latest_scan[0] if latest_scan else 0
+
+            online_count = conn.execute("""
+                SELECT COUNT(DISTINCT mac) FROM scan_events
+                WHERE scan_id = ? AND status = 'online'
+            """, (latest_scan_id,)).fetchone()[0]
+
+            offline_count = conn.execute("""
+                SELECT COUNT(*) FROM devices
+                WHERE mac NOT IN (
+                    SELECT DISTINCT mac FROM scan_events
+                    WHERE scan_id = ? AND status = 'online'
+                )
+            """, (latest_scan_id,)).fetchone()[0]
 
             total_scans    = conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
             total_alerts   = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]

@@ -123,6 +123,18 @@ def _get_host_mac_and_iface(host_ip: str) -> tuple[str, str]:
                     return mac, iface
     except Exception as e:
         log.debug("ip link parse failed: %s", e)
+    
+    # Method 3: /proc/net/arp — always readable, shows IP→MAC mapping
+    try:
+        with open("/proc/net/arp") as f:
+            for line in f.readlines()[1:]:   # skip header
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] == host_ip:
+                    mac = parts[3].upper().replace(":", ":")
+                    if mac and mac != "00:00:00:00:00:00":
+                        return mac, parts[5] if len(parts) > 5 else ""
+    except Exception as e:
+        log.debug("/proc/net/arp read failed: %s", e)
 
     return "", ""
 
@@ -161,7 +173,10 @@ def _scan_device(ip: str) -> tuple[list[str], str, int]:
     """
     Pass A — port scan (-sV):  always runs, failure → WARNING log
     Pass B — OS detection (-O): independent, failure → DEBUG log only
-    Returns (open_ports, os_name, os_accuracy).
+
+    OS detection key insight: nmap needs at least one OPEN and one CLOSED
+    port to build a TCP fingerprint. We always include port 1 (virtually
+    always closed) alongside discovered open ports as the probe set.
     """
     import nmap
 
@@ -169,7 +184,7 @@ def _scan_device(ip: str) -> tuple[list[str], str, int]:
     os_name:     str       = ""
     os_accuracy: int       = 0
 
-    # ── Pass A: Ports ─────────────────────────────────────────────────────────
+    # ── Pass A: Port + service scan ───────────────────────────────────────────
     try:
         nm = nmap.PortScanner()
         nm.scan(hosts=ip, arguments=f"-p {PORT_SCAN_LIST} --open -T4 -sV")
@@ -196,14 +211,21 @@ def _scan_device(ip: str) -> tuple[list[str], str, int]:
         log.warning("Port scan failed for %s: %s", ip, e)
 
     # ── Pass B: OS detection ──────────────────────────────────────────────────
+    # Build probe port list: open ports + port 1 (almost always closed).
+    # nmap needs both open AND closed ports to fingerprint reliably.
+    # Without a closed port, nmap logs "WARNING: RST not received" and skips.
     try:
-        nm_os   = nmap.PortScanner()
-        os_args = "-O --osscan-guess -T4"
-        if open_ports:
-            # Hint nmap with a known-open port → much better accuracy
-            hint = open_ports[0].split("/")[0]
-            os_args += f" -p {hint}"
+        nm_os = nmap.PortScanner()
 
+        if open_ports:
+            open_port_nums = ",".join(p.split("/")[0] for p in open_ports)
+            # Port 1 = almost certainly closed → gives nmap closed-port probe
+            probe_ports = f"1,{open_port_nums}"
+        else:
+            # No known open ports — scan a small spread hoping to find one
+            probe_ports = "1,22,80,443,8080"
+
+        os_args = f"-O --osscan-guess -p {probe_ports} -T3"
         nm_os.scan(hosts=ip, arguments=os_args)
 
         if ip in nm_os.all_hosts():
@@ -214,24 +236,26 @@ def _scan_device(ip: str) -> tuple[list[str], str, int]:
                 os_name     = best.get("name", "")
                 os_accuracy = int(best.get("accuracy", 0))
 
+            # Fallback: osclass is less specific but still useful
             if not os_name and hd.get("osclass"):
                 cls   = hd["osclass"][0]
-                parts = [x for x in [cls.get("vendor", ""),
-                                      cls.get("osfamily", ""),
-                                      cls.get("osgen", "")] if x]
+                parts = [x for x in [
+                    cls.get("vendor", ""),
+                    cls.get("osfamily", ""),
+                    cls.get("osgen", ""),
+                ] if x]
                 os_name     = " ".join(parts)
                 os_accuracy = int(cls.get("accuracy", 0))
 
         if os_name:
-            log.debug("OS %s: %s (%d%%)", ip, os_name, os_accuracy)
+            log.info("OS   %s: %s (%d%%)", ip, os_name, os_accuracy)
         else:
-            log.debug("OS %s: undetermined (normal for firewalled/IoT devices)", ip)
+            log.debug("OS   %s: undetermined (insufficient closed ports or strict firewall)", ip)
 
     except Exception as e:
         log.debug("OS detection failed for %s: %s", ip, e)
 
     return open_ports, os_name, os_accuracy
-
 
 def _scan_and_build(ip: str, host_data, host_ip: str) -> DeviceResult | None:
     """

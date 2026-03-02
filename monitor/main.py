@@ -120,7 +120,7 @@ def main():
     print_device_table()
 
     # ── 7. Schedule recurring scans ───────────────────────────────────────────
-    log.info("Scheduling scans every %d seconds", SCAN_INTERVAL)
+    log.info("Scan interval: %d seconds (change SCAN_INTERVAL in .env + restart)", SCAN_INTERVAL)
     schedule.every(SCAN_INTERVAL).seconds.do(run_scan)
     schedule.every().day.at("06:00").do(run_daily_export)
 
@@ -128,9 +128,6 @@ def main():
     while _running:
         schedule.run_pending()
         time.sleep(1)
-
-    log.info("Monitor stopped cleanly.")
-    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-version: "3.9"
+
 
 services:
   monitor:
@@ -12,12 +12,6 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-    environment:
-      - NETWORK_SUBNET=192.168.0.0/24
-      - ROUTER_IP=192.168.0.1
-      - SCAN_INTERVAL=60
-      - LOG_LEVEL=INFO
-      - DEDUP_WINDOW_MINUTES=30
     healthcheck:
       # Passes if heartbeat file was written within 3x the scan interval (3 min)
       test: >
