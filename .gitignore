@@ -1,0 +1,19 @@
+# Data and logs — never commit these
+data/
+logs/
+*.db
+*.log
+*.csv
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Docker
+.dockerignore

@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  monitor:
+    build: .
+    container_name: network-monitor
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - NETWORK_SUBNET=192.168.0.0/24
+      - ROUTER_IP=192.168.0.1
+      - SCAN_INTERVAL=60
+      - LOG_LEVEL=INFO
+      - DEDUP_WINDOW_MINUTES=30
+    healthcheck:
+      # Passes if heartbeat file was written within 3x the scan interval (3 min)
+      test: >
+        ["CMD", "python3", "-c",
+         "import os,time; hb='/app/data/heartbeat';
+          assert os.path.exists(hb) and (time.time()-os.path.getmtime(hb)) < 180,
+          'Scan loop stalled'"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
