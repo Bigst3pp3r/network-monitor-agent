@@ -52,5 +52,5 @@ def setup_logging():
     root.addHandler(file_handler)
 
     # Silence noisy third-party loggers
-    for noisy in ("scapy.runtime", "urllib3", "requests"):
+    for noisy in ("urllib3", "requests"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

@@ -110,9 +110,21 @@ def _api_lookup(prefix: str) -> str:
             f"https://api.macvendors.com/{mac_q}",
             timeout=5,
             headers={"User-Agent": "HomeNetworkMonitor/1.0"},
+            stream=True,        # don't load body until we check size
         )
         time.sleep(0.6)
-        result = r.text.strip() if r.status_code == 200 else "Unknown"
+
+        if r.status_code == 200:
+            # Cap at 256 bytes — a vendor name is never longer than this.
+            # Guards against a compromised API inflating the response.
+            raw = r.raw.read(256, decode_content=True).decode("utf-8", errors="ignore")
+            result = raw.strip()[:100]   # extra safety: truncate to 100 chars
+            # Sanity check: vendor names are printable text, no control chars
+            if not result.isprintable():
+                result = "Unknown"
+        else:
+            result = "Unknown"
+
         _api_cache[prefix] = result
         _save_api_cache()
         return result
