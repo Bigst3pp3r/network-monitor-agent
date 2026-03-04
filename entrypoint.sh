@@ -1,9 +1,7 @@
 #!/bin/bash
-# entrypoint.sh — Fix volume mount permissions then run as scanner user
+# entrypoint.sh — Runs as root (required for nmap -O raw socket access).
+# Privilege escalation is prevented by no-new-privileges in docker-compose.yml.
 
-# Ensure the scanner user owns the mounted data/logs directories
-# (Docker creates mounted volumes as root, so we fix this at startup)
-chown -R scanner:scanner /app/data /app/logs 2>/dev/null || true
+mkdir -p /app/data /app/logs /app/data/exports
 
-# Drop privileges and run the monitor
-exec gosu scanner python -m monitor.main
+exec python -m monitor.main

@@ -1,4 +1,4 @@
-
+version: "3.9"
 
 services:
   monitor:
@@ -7,13 +7,17 @@ services:
     restart: unless-stopped
     network_mode: host
     cap_add:
-      - NET_ADMIN
-      - NET_RAW
+      - NET_ADMIN       # required: ARP scanning, interface control
+      - NET_RAW         # required: nmap raw packet crafting for -O
+    security_opt:
+      - no-new-privileges:true  # prevents any process from gaining more privileges
+                                # than it starts with — the key escalation defence
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+    env_file:
+      - .env
     healthcheck:
-      # Passes if heartbeat file was written within 3x the scan interval (3 min)
       test: >
         ["CMD", "python3", "-c",
          "import os,time; hb='/app/data/heartbeat';
