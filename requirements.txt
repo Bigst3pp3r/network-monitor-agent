@@ -2,3 +2,4 @@ python-nmap==0.7.1
 requests==2.32.3
 schedule==1.2.1
 rich==13.7.0
+python-telegram-bot==20.7

@@ -22,10 +22,13 @@ log = logging.getLogger(__name__)
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES,
+                           timeout=10)   # wait up to 10s if DB is locked
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # busy_timeout: retry on SQLITE_BUSY instead of failing immediately
+    # critical when container writer and host CLI reader overlap
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
         conn.commit()
@@ -40,6 +43,10 @@ def get_conn():
 
 def init_db():
     with get_conn() as conn:
+        # WAL mode: set once here — more concurrent-friendly than DELETE journal
+        # Allows readers and one writer simultaneously without blocking
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, faster than FULL
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS devices (
                 mac             TEXT PRIMARY KEY,
@@ -159,14 +166,24 @@ def upsert_device(mac: str, vendor: str, hostname: str,
             is_known    = 1 if times_seen >= BASELINE_SEEN_THRESHOLD else existing["is_known"]
             vendor      = vendor   or existing["vendor"]
             hostname    = hostname or existing["hostname"]
-            # Keep OS info if new scan has better accuracy
+            # OS update policy:
+            # Only replace stored OS if the new result is meaningfully better
+            # (10+ accuracy points). nmap is not perfectly consistent scan-to-scan
+            # so a small fluctuation (90% → 91%) should NOT overwrite stored data.
+            # If no OS is stored yet, accept any result with accuracy > 0.
             existing_acc = existing["os_accuracy"] or 0
-            if os_accuracy >= existing_acc and os_info:
-                final_os      = os_info
-                final_os_acc  = os_accuracy
+            existing_os  = existing["os_info"] or ""
+            ACCURACY_IMPROVEMENT_THRESHOLD = 10
+
+            if not existing_os and os_info and os_accuracy > 0:
+                # Nothing stored yet — take the first valid result
+                final_os, final_os_acc = os_info, os_accuracy
+            elif os_info and os_accuracy >= existing_acc + ACCURACY_IMPROVEMENT_THRESHOLD:
+                # New result is significantly more confident — upgrade
+                final_os, final_os_acc = os_info, os_accuracy
             else:
-                final_os      = existing["os_info"] or os_info
-                final_os_acc  = existing_acc or os_accuracy
+                # Keep what we have
+                final_os, final_os_acc = existing_os, existing_acc
             conn.execute("""
                 UPDATE devices
                    SET last_seen=?, times_seen=?, is_known=?, is_host=?,
@@ -186,6 +203,33 @@ def upsert_device(mac: str, vendor: str, hostname: str,
     return device
 
 
+def set_label(mac: str, label: str) -> bool:
+    """
+    Set or clear the friendly label for a device.
+    label='' clears the label back to defaults.
+    Returns True if the device was found and updated.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE devices SET notes=? WHERE mac=?",
+            (label.strip() or None, mac)
+        )
+    return cur.rowcount > 0
+
+
+def get_device_by_ip(ip: str) -> dict | None:
+    """Find the most recently seen device with this IP."""
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT mac FROM scan_events
+            WHERE ip = ?
+            ORDER BY scanned_at DESC LIMIT 1
+        """, (ip,)).fetchone()
+    if not row:
+        return None
+    return get_device(row["mac"])
+
+
 def get_all_devices() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
@@ -202,13 +246,28 @@ def get_device(mac: str) -> dict | None:
     return dict(row) if row else None
 
 
-def get_last_known_ports(mac: str) -> set[str]:
+def get_last_known_ports(mac: str, before_scan_id: int | None = None) -> set[str]:
+    """
+    Return the set of open ports recorded for this device in the most recent
+    scan event BEFORE before_scan_id.
+
+    Why before_scan_id: record_scan_event() for the current scan is written
+    before the port-change check runs. Without this guard, get_last_known_ports
+    would return the CURRENT scan's ports, making newly_opened always empty.
+    """
     with get_conn() as conn:
-        row = conn.execute("""
-            SELECT open_ports FROM scan_events
-             WHERE mac=? AND status='online'
-             ORDER BY scanned_at DESC LIMIT 1
-        """, (mac,)).fetchone()
+        if before_scan_id is not None:
+            row = conn.execute("""
+                SELECT open_ports FROM scan_events
+                 WHERE mac=? AND status='online' AND scan_id < ?
+                 ORDER BY scan_id DESC LIMIT 1
+            """, (mac, before_scan_id)).fetchone()
+        else:
+            row = conn.execute("""
+                SELECT open_ports FROM scan_events
+                 WHERE mac=? AND status='online'
+                 ORDER BY scanned_at DESC LIMIT 1
+            """, (mac,)).fetchone()
     if row and row["open_ports"]:
         return set(row["open_ports"].split(","))
     return set()

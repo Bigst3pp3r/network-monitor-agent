@@ -1,17 +1,5 @@
 """
 main.py — Entry point for the network monitor agent.
-
-Startup sequence
-----------------
-1. Create data/log directories (must be first — before logging)
-2. Configure logging
-3. Initialise SQLite database
-4. Download / load OUI vendor database
-5. Run one immediate scan
-6. Schedule recurring scans every SCAN_INTERVAL seconds
-7. Block forever on the scheduler loop
-
-Graceful shutdown on SIGINT / SIGTERM.
 """
 
 import logging
@@ -19,28 +7,29 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime
-from monitor.timeutil import now_iso, now_display
 
 import schedule
 
-from monitor.config import SCAN_INTERVAL, DATA_DIR, LOG_DIR, EXPORT_DIR, HEARTBEAT_PATH
+from monitor.config import (
+    SCAN_INTERVAL, DATA_DIR, LOG_DIR, EXPORT_DIR,
+    HEARTBEAT_PATH, NETWORK_SUBNET,
+)
+from monitor.timeutil import now_iso
 
 log = logging.getLogger(__name__)
 
-# Global state — tracks which MACs were online in the previous scan
 _previously_online: set[str] = set()
 _running = True
 
 
 def _handle_signal(signum, frame):
     global _running
-    log.info("Shutdown signal received (%s) — stopping gracefully…", signum)
+    log.info("Shutdown signal received (%s) — stopping…", signum)
     _running = False
 
 
-def run_scan():
-    """Execute one full scan cycle."""
+def run_scan() -> dict:
+    """Execute one full scan cycle. Returns summary dict."""
     global _previously_online
 
     from monitor import db
@@ -50,7 +39,6 @@ def run_scan():
 
     log.info("Starting scan cycle…")
     scan_id = db.start_scan()
-
     results = scan_network()
 
     summary = process_scan(
@@ -58,6 +46,7 @@ def run_scan():
         current_results=results,
         previously_online_macs=_previously_online,
     )
+    summary["online_count"] = len(results)
 
     _previously_online = {r.mac for r in results}
 
@@ -71,7 +60,6 @@ def run_scan():
 
     print_scan_summary(summary, total_online=len(results))
 
-    # Write heartbeat so Docker healthcheck can verify the loop is alive
     try:
         with open(HEARTBEAT_PATH, "w") as f:
             f.write(now_iso())
@@ -81,53 +69,91 @@ def run_scan():
     return summary
 
 
+def _send_alive_ping():
+    """Periodic proof-of-life push — silence means agent is down."""
+    try:
+        from monitor.telegram_bot import get_bot
+        from monitor import formatter
+        from monitor.config import ALIVE_PING_HOURS
+        bot = get_bot()
+        if bot:
+            bot.send_message(formatter.alive_ping(ALIVE_PING_HOURS))
+    except Exception as e:
+        log.warning("Alive ping failed: %s", e)
+
+
 def run_daily_export():
+    """Export CSV and push daily summary to Telegram."""
     from monitor.reporter import export_csv_snapshot
+    from monitor import formatter
+
     path = export_csv_snapshot()
-    log.info("Daily CSV export saved: %s", path)
+    log.info("Daily CSV export: %s", path)
+
+    # Push summary digest to Telegram
+    try:
+        from monitor.telegram_bot import get_bot
+        bot = get_bot()
+        if bot:
+            bot.send_message(formatter.daily_summary_message())
+    except Exception as e:
+        log.warning("Failed to push daily summary to Telegram: %s", e)
 
 
 def main():
-    # ── 1. Directories FIRST — before anything tries to write a file ──────────
     for d in (DATA_DIR, LOG_DIR, EXPORT_DIR):
         os.makedirs(d, exist_ok=True)
 
-    # ── 2. Logging (now safe — log dir exists) ────────────────────────────────
     from monitor.logger import setup_logging
     setup_logging()
 
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    log.info("  Home Network Monitor — Phase 1")
+    log.info("  Home Network Monitor — Phase 2")
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    # ── 3. Graceful shutdown hooks ────────────────────────────────────────────
     signal.signal(signal.SIGINT,  _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    # ── 4. Init database ──────────────────────────────────────────────────────
     from monitor import db
     db.init_db()
 
-    # ── 5. Load OUI vendor database ───────────────────────────────────────────
     from monitor.oui import ensure_oui_ready
     ensure_oui_ready()
 
-    # ── 6. First scan immediately on startup ──────────────────────────────────
+    from monitor.telegram_bot import TelegramBot
+    import monitor.telegram_bot as _tb_module
+    bot = TelegramBot()
+    bot.start()
+    _tb_module._bot_instance = bot
+
     log.info("Running initial scan…")
     run_scan()
 
     from monitor.reporter import print_device_table
     print_device_table()
 
-    # ── 7. Schedule recurring scans ───────────────────────────────────────────
-    log.info("Scan interval: %d seconds (change SCAN_INTERVAL in .env + restart)", SCAN_INTERVAL)
+    from monitor import formatter
+    device_count = len(db.get_all_devices())
+    bot.send_message(formatter.startup_message(device_count, NETWORK_SUBNET, SCAN_INTERVAL))
+
+    from monitor.config import ALIVE_PING_HOURS
+
+    log.info("Scheduling scans every %d seconds", SCAN_INTERVAL)
     schedule.every(SCAN_INTERVAL).seconds.do(run_scan)
     schedule.every().day.at("06:00").do(run_daily_export)
 
-    # ── 8. Main loop ──────────────────────────────────────────────────────────
+    if ALIVE_PING_HOURS > 0:
+        schedule.every(ALIVE_PING_HOURS).hours.do(_send_alive_ping)
+        log.info("Alive ping every %dh — silence = agent down", ALIVE_PING_HOURS)
+
     while _running:
         schedule.run_pending()
         time.sleep(1)
+
+    log.info("Shutting down…")
+    bot.stop(message=formatter.shutdown_message())
+    log.info("Monitor stopped cleanly.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
