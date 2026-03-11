@@ -308,6 +308,43 @@ def get_recent_alerts(limit: int = 20) -> list[dict]:
 
 # ── Export helper ─────────────────────────────────────────────────────────────
 
+def check_integrity() -> str:
+    """
+    Run SQLite integrity_check pragma.
+    Returns 'ok' on success, or the first error string on failure.
+    Quick check only — skips b-tree verification for speed.
+    """
+    with get_conn() as conn:
+        row = conn.execute("PRAGMA quick_check").fetchone()
+    return row[0] if row else "no result"
+
+
+def purge_old_scan_events(retain_days: int = 30) -> int:
+    """
+    Delete scan_events rows older than retain_days.
+    Deletes via scan_id join to scans.started_at — avoids a full table scan
+    on scan_events and keeps the index happy.
+    Returns number of rows deleted.
+    """
+    from monitor.timeutil import now_iso
+    import datetime
+    cutoff = (
+        datetime.datetime.now() - datetime.timedelta(days=retain_days)
+    ).strftime("%Y-%m-%dT%H:%M:%S")
+
+    with get_conn() as conn:
+        cur = conn.execute("""
+            DELETE FROM scan_events
+             WHERE scan_id IN (
+                 SELECT id FROM scans WHERE started_at < ?
+             )
+        """, (cutoff,))
+        deleted = cur.rowcount
+        # Also prune the scans table itself
+        conn.execute("DELETE FROM scans WHERE started_at < ?", (cutoff,))
+    return deleted
+
+
 def export_devices_csv(path: str):
     import csv
     devices = get_all_devices()

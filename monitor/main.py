@@ -69,6 +69,50 @@ def run_scan() -> dict:
     return summary
 
 
+def _check_stalled():
+    """
+    Push a stalled alert if the heartbeat file hasn't been updated in
+    3× the scan interval. Distinct from the alive ping — this fires when
+    the container is running but the scan loop itself has frozen.
+    """
+    try:
+        age = time.time() - os.path.getmtime(HEARTBEAT_PATH)
+    except FileNotFoundError:
+        return  # not yet written — agent just started
+    except Exception:
+        return
+
+    stale_threshold = SCAN_INTERVAL * 3
+    if age > stale_threshold:
+        log.error("Scan loop stalled — heartbeat age %.0fs > threshold %.0fs",
+                  age, stale_threshold)
+        try:
+            from monitor.telegram_bot import get_bot
+            from monitor import formatter
+            bot = get_bot()
+            if bot:
+                bot.send_message(formatter.alert_stalled())
+        except Exception as e:
+            log.warning("Failed to push stalled alert: %s", e)
+
+
+def _run_db_cleanup():
+    """
+    Purge old scan_events rows to prevent unbounded DB growth.
+    At 60s interval with 4 devices: ~1440 rows/device/day → ~2M rows/year.
+    Keeps the last SCAN_EVENTS_RETAIN_DAYS days of data (default 30).
+    """
+    from monitor import db
+    from monitor.config import SCAN_EVENTS_RETAIN_DAYS
+    try:
+        deleted = db.purge_old_scan_events(SCAN_EVENTS_RETAIN_DAYS)
+        if deleted:
+            log.info("DB cleanup: removed %d old scan_event rows (>%dd)",
+                     deleted, SCAN_EVENTS_RETAIN_DAYS)
+    except Exception as e:
+        log.warning("DB cleanup failed: %s", e)
+
+
 def _send_alive_ping():
     """Periodic proof-of-life push — silence means agent is down."""
     try:
@@ -104,8 +148,13 @@ def main():
     for d in (DATA_DIR, LOG_DIR, EXPORT_DIR):
         os.makedirs(d, exist_ok=True)
 
-    from monitor.logger import setup_logging
+    from monitor.logger import setup_logging, sensitive_filter
     setup_logging()
+
+    # Activate log scrubbing — must happen immediately after logging is set up
+    # so no subsequent log call can emit the raw token or chat_id
+    from monitor.config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    sensitive_filter.configure(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
 
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("  Home Network Monitor — Phase 2")
@@ -116,6 +165,25 @@ def main():
 
     from monitor import db
     db.init_db()
+
+    # ── DB integrity check ────────────────────────────────────────────────────
+    try:
+        result = db.check_integrity()
+        if result != "ok":
+            log.error("DB integrity check FAILED: %s — monitor may be unreliable", result)
+        else:
+            log.info("DB integrity: ok")
+    except Exception as e:
+        log.error("DB integrity check error: %s", e)
+
+    # ── Enforce .env permissions at runtime ───────────────────────────────────
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    env_path = os.path.normpath(env_path)
+    try:
+        if os.path.exists(env_path):
+            os.chmod(env_path, 0o600)
+    except Exception as e:
+        log.warning(".env chmod failed: %s", e)
 
     from monitor.oui import ensure_oui_ready
     ensure_oui_ready()
@@ -141,6 +209,8 @@ def main():
     log.info("Scheduling scans every %d seconds", SCAN_INTERVAL)
     schedule.every(SCAN_INTERVAL).seconds.do(run_scan)
     schedule.every().day.at("06:00").do(run_daily_export)
+    schedule.every().day.at("03:00").do(_run_db_cleanup)
+    schedule.every(2).minutes.do(_check_stalled)
 
     if ALIVE_PING_HOURS > 0:
         schedule.every(ALIVE_PING_HOURS).hours.do(_send_alive_ping)

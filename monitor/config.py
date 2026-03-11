@@ -81,7 +81,6 @@ PORT_SCAN_LIST = (
     "50070,50075,50090,51000,51413,52000,52869,54045,55000,55555,"
     "56789,57797,58080,60000,61000,62078,65000"
 )
-
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
@@ -114,3 +113,6 @@ ALERT_FLOOD_LIMIT = int(os.getenv("ALERT_FLOOD_LIMIT", "5"))
 
 # Hours between proof-of-life pings to Telegram (0 = disabled)
 ALIVE_PING_HOURS  = int(os.getenv("ALIVE_PING_HOURS", "6"))
+
+# Days of scan_events history to retain (older rows are purged nightly)
+SCAN_EVENTS_RETAIN_DAYS = int(os.getenv("SCAN_EVENTS_RETAIN_DAYS", "30"))
